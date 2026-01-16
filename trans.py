@@ -1,139 +1,162 @@
 import sys
 import os
 import re
-import time
 import traceback
+import tempfile
 import torch
 import keyboard  # pip install keyboard
 from PIL import ImageGrab
 
-# --- 1. CẤU HÌNH FIX LỖI DLL TORCH ---
+# --- 1. CẤU HÌNH FIX LỖI DLL TORCH (Windows) ---
 path_to_torch_dlls = r"C:\Users\admin\AppData\Local\Programs\Python\Python311\Lib\site-packages\torch\lib"
 if os.path.exists(path_to_torch_dlls):
     os.add_dll_directory(path_to_torch_dlls)
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QLabel, 
-                             QVBoxLayout, QWidget, QFrame, QHBoxLayout)
+                             QVBoxLayout, QWidget, QFrame)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRect, QPoint
-from PyQt5.QtGui import QCursor, QPainter, QColor, QPen, QBrush
+from PyQt5.QtGui import QPainter, QColor, QPen
 
 # --- IMPORT MODELS ---
-# pip install sentencepiece protobuf transformers
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModel
 
-# --- BIẾN TOÀN CỤC ---
-GLOBAL_OCR_MODEL = None
-GLOBAL_OCR_TOKENIZER = None
-GLOBAL_TRANS_MODEL = None
-GLOBAL_TRANS_TOKENIZER = None
+# --- QUẢN LÝ MODEL (SINGLETON PATTERN) ---
+class ModelManager:
+    _instance = None
+    
+    def __init__(self):
+        self.ocr_model = None
+        self.ocr_tokenizer = None
+        self.trans_model = None
+        self.trans_tokenizer = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-class GOTOCRWorker(QThread):
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def load_ocr(self):
+        if self.ocr_model is None:
+            model_name = 'ucaslcl/GOT-OCR2_0'
+            print(">>> Loading OCR Model...")
+            self.ocr_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self.ocr_model = AutoModel.from_pretrained(
+                model_name, 
+                trust_remote_code=True, 
+                low_cpu_mem_usage=True, 
+                device_map=self.device, 
+                use_safetensors=True, 
+                pad_token_id=self.ocr_tokenizer.eos_token_id
+            ).eval()
+            if self.device == "cuda":
+                self.ocr_model = self.ocr_model.cuda() # Đảm bảo nằm trên GPU
+
+    def load_trans(self):
+        if self.trans_model is None:
+            model_name = "facebook/nllb-200-distilled-600M"
+            print(">>> Loading Trans Model...")
+            self.trans_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            # Dùng float16 để nhẹ và nhanh hơn
+            self.trans_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, 
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+            ).to(self.device).eval()
+
+# --- WORKER XỬ LÝ NẶNG ---
+class WorkerThread(QThread):
+    status_update = pyqtSignal(str)
     result_ready = pyqtSignal(str)
-    model_loaded_signal = pyqtSignal()
 
     def __init__(self, image_path=None, mode="scan"):
         super().__init__()
         self.image_path = image_path
         self.mode = mode
+        self.manager = ModelManager.get_instance()
 
     def clean_text(self, text):
-        """Hàm làm sạch rác OCR để dịch chuẩn hơn"""
-        # 1. Nối dấu nháy: "school ' s" -> "school's"
-        text = re.sub(r"\s+(['’])\s*([a-zA-Z])", r"'\2", text)
-        # 2. Nối dấu câu: "Hello ." -> "Hello."
-        text = re.sub(r"\s+([.,!?;:])", r"\1", text)
-        # 3. Mẹo nối từ bị đứt (VD: "handsomes t" -> "handsomest")
-        text = re.sub(r"([a-zA-Z]{3,})\s+([a-zA-Z])\b", r"\1\2", text)
-        # 4. Xóa xuống dòng thừa
+        """Làm sạch text thông minh hơn"""
         text = text.replace("\n", " ")
-        # 5. Xóa khoảng trắng kép
         text = re.sub(r"\s+", " ", text).strip()
+        # Nối từ bị đứt (VD: "exam- ple" -> "example")
+        text = re.sub(r"([a-z])-\s+([a-z])", r"\1\2", text)
+        # Fix lỗi khoảng trắng trước dấu câu
+        text = re.sub(r"\s+([.,!?;:])", r"\1", text)
         return text
 
     def run(self):
-        global GLOBAL_OCR_MODEL, GLOBAL_OCR_TOKENIZER, GLOBAL_TRANS_MODEL, GLOBAL_TRANS_TOKENIZER
         try:
-            # --- 1. Nạp Model OCR ---
-            if GLOBAL_OCR_MODEL is None:
-                self.result_ready.emit("🚀 Đang nạp Model OCR (GOT-2.0)...")
-                model_ocr_name = 'ucaslcl/GOT-OCR2_0'
-                GLOBAL_OCR_TOKENIZER = AutoTokenizer.from_pretrained(model_ocr_name, trust_remote_code=True)
-                GLOBAL_OCR_MODEL = AutoModel.from_pretrained(
-                    model_ocr_name, trust_remote_code=True, low_cpu_mem_usage=True, 
-                    device_map='cuda', use_safetensors=True, 
-                    pad_token_id=GLOBAL_OCR_TOKENIZER.eos_token_id
-                )
-                GLOBAL_OCR_MODEL = GLOBAL_OCR_MODEL.eval().cuda()
+            # 1. Nạp Models (Nếu chưa nạp)
+            if self.mode == "preload":
+                self.status_update.emit("🚀 Đang nạp OCR...")
+                self.manager.load_ocr()
+                self.status_update.emit("🚀 Đang nạp Trans...")
+                self.manager.load_trans()
+                self.status_update.emit(f"✅ Sẵn sàng! (GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'OFF'}). Alt+X để chụp.")
+                return
 
-            # --- 2. Nạp Model Dịch ---
-            if GLOBAL_TRANS_MODEL is None:
-                self.result_ready.emit("🚀 Đang nạp Model NLLB-200...")
-                model_trans_name = "facebook/nllb-200-distilled-600M"
-                GLOBAL_TRANS_TOKENIZER = AutoTokenizer.from_pretrained(model_trans_name)
-                GLOBAL_TRANS_MODEL = AutoModelForSeq2SeqLM.from_pretrained(model_trans_name)
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                GLOBAL_TRANS_MODEL = GLOBAL_TRANS_MODEL.to(device)
-                
-                self.result_ready.emit(f"✅ Sẵn sàng! (GPU: {torch.cuda.is_available()}). Bấm Alt+X để chụp.")
-                self.model_loaded_signal.emit()
-
-            if self.mode == "preload": return
-
-            # --- 3. Thực hiện OCR ---
+            # 2. Xử lý OCR
             if not self.image_path: return
-            self.result_ready.emit("⏳ Đang đọc chữ từ ảnh...")
+            self.status_update.emit("🔍 Đang đọc chữ (OCR)...")
             
-            abs_image_path = os.path.abspath(self.image_path)
-            res = GLOBAL_OCR_MODEL.chat(GLOBAL_OCR_TOKENIZER, abs_image_path, ocr_type='ocr')
+            # Đảm bảo model đã load
+            self.manager.load_ocr()
+            
+            res = self.manager.ocr_model.chat(self.manager.ocr_tokenizer, self.image_path, ocr_type='ocr')
             raw_text = str(res)
-            
-            # --- 4. Làm sạch & Dịch (Chia câu) ---
-            self.result_ready.emit("⏳ Đang dịch...")
             clean_text_str = self.clean_text(raw_text)
-            
-            # Tách câu để dịch không bị sót
-            sentences = re.split(r'([.!?]+)', clean_text_str)
-            translated_parts = []
-            
-            # Ghép lại thành các câu hoàn chỉnh (Text + Dấu câu)
-            full_sentences = []
-            current_sent = ""
-            for part in sentences:
-                if re.match(r'[.!?]+', part):
-                    current_sent += part
-                    full_sentences.append(current_sent)
-                    current_sent = ""
-                else:
-                    current_sent += part
-            if current_sent: full_sentences.append(current_sent)
 
-            # Dịch từng câu
-            device = GLOBAL_TRANS_MODEL.device
-            tgt_lang = "vie_Latn"
+            if not clean_text_str:
+                self.result_ready.emit("⚠️ Không tìm thấy chữ trong ảnh!")
+                return
+
+            # 3. Dịch Thuật (Batch Processing)
+            self.status_update.emit("🌐 Đang dịch...")
+            self.manager.load_trans()
             
-            for sent in full_sentences:
-                if len(sent.strip()) < 2: continue
+            # Tách câu
+            sentences = re.split(r'(?<=[.!?])\s+', clean_text_str)
+            sentences = [s for s in sentences if len(s.strip()) > 1]
+            
+            final_vn = ""
+            if sentences:
+                tokenizer = self.manager.trans_tokenizer
+                model = self.manager.trans_model
+                device = self.manager.device
+                tgt_lang = "vie_Latn"
+
+                # Batch hóa dữ liệu đầu vào (Gửi 1 lần nhiều câu)
+                inputs = tokenizer(sentences, return_tensors="pt", padding=True, truncation=True).to(device)
                 
-                inputs = GLOBAL_TRANS_TOKENIZER(sent, return_tensors="pt").to(device)
-                translated_tokens = GLOBAL_TRANS_MODEL.generate(
-                    **inputs, 
-                    forced_bos_token_id=GLOBAL_TRANS_TOKENIZER.lang_code_to_id[tgt_lang], 
-                    max_length=512
-                )
-                trans_text = GLOBAL_TRANS_TOKENIZER.batch_decode(translated_tokens, skip_special_tokens=True)[0]
-                translated_parts.append(trans_text)
+                with torch.no_grad():
+                    translated_tokens = model.generate(
+                        **inputs, 
+                        forced_bos_token_id=tokenizer.lang_code_to_id[tgt_lang], 
+                        max_length=512
+                    )
+                
+                # Decode kết quả
+                trans_texts = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+                final_vn = " ".join(trans_texts)
 
-            final_vn = " ".join(translated_parts)
-            final_output = f"🇬🇧 GỐC:\n{clean_text_str}\n\n🇻🇳 DỊCH:\n{final_vn}"
+            # 4. Trả kết quả
+            final_output = f"🇬🇧 <b>GỐC:</b><br>{clean_text_str}<br><br>🇻🇳 <b>DỊCH:</b><br>{final_vn}"
             self.result_ready.emit(final_output)
 
         except Exception as e:
             traceback.print_exc()
-            self.result_ready.emit(f"Lỗi: {str(e)}")
+            self.result_ready.emit(f"❌ Lỗi: {str(e)}")
+        finally:
+            # Xóa file ảnh tạm
+            if self.image_path and os.path.exists(self.image_path):
+                try:
+                    os.remove(self.image_path)
+                except: pass
 
-# --- PHẦN SNIPPING TOOL (ĐÃ FIX LỖI VÙNG CHỌN CŨ) ---
+# --- SNIPPING TOOL ---
 class SnippingWidget(QWidget):
-    snippet_taken = pyqtSignal(object) 
+    snippet_taken = pyqtSignal(str) 
 
     def __init__(self):
         super().__init__()
@@ -145,7 +168,7 @@ class SnippingWidget(QWidget):
         self.is_sniping = False
 
     def start_selection(self):
-        # FIX: Reset tọa độ để không hiện lại khung đỏ cũ
+        # Reset mỗi khi bắt đầu phiên làm việc mới cho chắc chắn
         self.start_point = None
         self.end_point = None
         self.setGeometry(QApplication.primaryScreen().geometry())
@@ -154,19 +177,22 @@ class SnippingWidget(QWidget):
 
     def paintEvent(self, event):
         if not self.isVisible(): return
+        
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        
+        # Vẽ lớp phủ mờ toàn màn hình
         painter.setBrush(QColor(0, 0, 0, 100))
         painter.setPen(Qt.NoPen)
         painter.drawRect(self.rect())
 
+        # CHỈ vẽ khung đỏ nếu cả 2 điểm đều đã tồn tại
         if self.start_point and self.end_point:
             rect = QRect(self.start_point, self.end_point).normalized()
             painter.setCompositionMode(QPainter.CompositionMode_Clear)
             painter.drawRect(rect)
             painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
-            painter.setPen(QPen(Qt.red, 2))
-            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(0, 255, 204), 2))
             painter.drawRect(rect)
 
     def mousePressEvent(self, event):
@@ -183,105 +209,128 @@ class SnippingWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if not self.is_sniping: return
         self.is_sniping = False
+        
         rect = QRect(self.start_point, event.pos()).normalized()
-        self.hide() 
+        
+        # Lấy tọa độ xong thì ẩn ngay và xóa điểm
+        self.hide()
+        
+        # XỬ LÝ CHỤP ẢNH
         if rect.width() > 10 and rect.height() > 10:
-            x, y = rect.x(), rect.y()
-            w, h = rect.width(), rect.height()
-            try:
-                img = ImageGrab.grab(bbox=(x, y, x+w, y+h))
-                img.save("capture.jpg", quality=100)
-                self.snippet_taken.emit("capture.jpg")
-            except Exception as e:
-                print(e)
+            # Thực hiện chụp ảnh ở đây (giống code cũ của bạn)
+            path = self.capture_screen(rect)
+            self.snippet_taken.emit(path)
+        
+        # QUAN TRỌNG: Reset về None ngay lập tức sau khi hoàn tất
+        self.start_point = None
+        self.end_point = None
+        self.update() # Vẽ lại một lần cuối để xóa khung
 
-# --- GIAO DIỆN CHÍNH (ĐÃ FIX LỖI NÚT BẤM) ---
+    def capture_screen(self, rect):
+        # Hàm phụ để xử lý lưu ảnh
+        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        img = ImageGrab.grab(bbox=(x, y, x+w, y+h))
+        img.save(path, quality=95)
+        return path
+
+# --- GIAO DIỆN CHÍNH ---
 class ResultWindow(QMainWindow):
     request_snip_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        # Cấu hình cửa sổ không viền, luôn nổi
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(500, 400)
         self.old_pos = None
 
+        # Widget chính
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.layout = QVBoxLayout(self.central_widget)
+        self.layout.setContentsMargins(0, 0, 0, 0)
         
+        # Frame chứa nội dung
         self.frame = QFrame()
         self.frame.setStyleSheet("""
             QFrame {
-                background-color: rgba(20, 20, 20, 0.95);
-                border: 2px solid #00ffcc;
-                border-radius: 10px;
-                color: white;
+                background-color: rgba(28, 28, 30, 0.95);
+                border: 1px solid #333;
+                border-radius: 12px;
+                color: #E0E0E0;
             }
         """)
         self.layout.addWidget(self.frame)
         self.frame_layout = QVBoxLayout(self.frame)
 
-        # Tiêu đề
-        self.lbl_title = QLabel("NLLB-200 TRANSLATOR (Alt + X)")
-        self.lbl_title.setStyleSheet("font-weight: bold; color: #00ffcc; font-size: 14px; border: none;")
-        self.frame_layout.addWidget(self.lbl_title)
+        # Header
+        header_layout = QVBoxLayout()
+        self.lbl_title = QLabel("AI TRANSLATOR (Alt + X)")
+        self.lbl_title.setStyleSheet("font-weight: bold; color: #00FFCC; font-size: 14px; border: none;")
+        header_layout.addWidget(self.lbl_title)
+        self.frame_layout.addLayout(header_layout)
 
-        # Kết quả
-        self.lbl_result = QLabel("Đang khởi động Model...")
+        # Nội dung Text
+        self.lbl_result = QLabel("Đang khởi động AI...")
         self.lbl_result.setWordWrap(True)
         self.lbl_result.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.lbl_result.setStyleSheet("border: none; padding: 5px; font-size: 13px;")
+        self.lbl_result.setStyleSheet("border: none; padding: 5px; font-size: 13px; color: white;")
         self.lbl_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.frame_layout.addWidget(self.lbl_result)
         self.frame_layout.addStretch()
 
-        # Nút Thu nhỏ (FIX LỖI)
-        self.btn_close = QPushButton("Thu nhỏ (-)")
-        self.btn_close.clicked.connect(self.handle_minimize) # Dùng hàm riêng
-        self.btn_close.setStyleSheet("background: #444; color: white; border-radius: 5px; padding: 6px;")
-        self.frame_layout.addWidget(self.btn_close)
+        # Nút Đóng
+        self.btn_minimize = QPushButton("Thu nhỏ")
+        self.btn_minimize.setCursor(Qt.PointingHandCursor)
+        self.btn_minimize.clicked.connect(self.showMinimized)
+        self.btn_minimize.setStyleSheet("""
+            QPushButton {
+                background: #3A3A3C; color: white; border-radius: 6px; padding: 8px;
+                border: 1px solid #48484A;
+            }
+            QPushButton:hover { background: #48484A; }
+        """)
+        self.frame_layout.addWidget(self.btn_minimize)
 
-        # Worker & Signals
+        # Logic Snipping & Worker
         self.snipper = SnippingWidget()
         self.snipper.snippet_taken.connect(self.process_image)
 
-        self.preload_worker = GOTOCRWorker(mode="preload")
-        self.preload_worker.result_ready.connect(self.update_status)
+        self.preload_worker = WorkerThread(mode="preload")
+        self.preload_worker.status_update.connect(self.update_text)
         self.preload_worker.start()
 
         self.request_snip_signal.connect(self.start_snipping)
-        keyboard.add_hotkey('alt+x', self.emit_snip_signal)
-
-    def handle_minimize(self):
-        # Ép cửa sổ thu nhỏ
-        self.setWindowState(Qt.WindowMinimized)
-
-    def emit_snip_signal(self):
-        self.request_snip_signal.emit()
+        try:
+            keyboard.add_hotkey('alt+x', self.request_snip_signal.emit)
+        except ImportError:
+            print("Cần chạy quyền Admin để dùng hotkey")
 
     def start_snipping(self):
         self.hide()
         self.snipper.start_selection()
 
     def process_image(self, img_path):
-        self.showNormal() # Hiện lại cửa sổ
+        self.showNormal()
         self.activateWindow()
-        self.update_status("⏳ Đang xử lý ảnh...")
-        self.worker = GOTOCRWorker(image_path=img_path, mode="scan")
-        self.worker.result_ready.connect(self.update_status)
+        self.update_text("⏳ Đang xử lý...")
+        
+        self.worker = WorkerThread(image_path=img_path, mode="scan")
+        self.worker.status_update.connect(self.update_text)
+        self.worker.result_ready.connect(self.update_html_text) # Dùng HTML để format đẹp hơn
         self.worker.start()
 
-    def update_status(self, text):
+    def update_text(self, text):
         self.lbl_result.setText(text)
 
-    # --- FIX LỖI KÉO CỬA SỔ ---
+    def update_html_text(self, text):
+        self.lbl_result.setText(text)
+
+    # --- DRAGGABLE WINDOW ---
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # Nếu bấm vào nút thì KHÔNG tính là kéo cửa sổ
-            if isinstance(self.childAt(event.pos()), QPushButton):
-                return
             self.old_pos = event.globalPos()
 
     def mouseMoveEvent(self, event):
